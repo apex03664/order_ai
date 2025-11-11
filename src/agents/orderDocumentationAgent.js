@@ -7,6 +7,116 @@ class OrderDocumentationAgent {
     this.name = 'OrderDocumentationAgent';
   }
 
+  // Helper function to extract JSON from markdown code blocks
+  extractJSON(content) {
+    if (!content) {
+      logger.error('extractJSON: Content is empty or null');
+      return null;
+    }
+    
+    try {
+      // Remove markdown code blocks if present
+      let cleaned = content.trim();
+      
+      // First, try to find and extract JSON from code blocks (most common case)
+      // Match ```json ... ``` or ``` ... ``` patterns
+      const codeBlockPattern = /```(?:json)?\s*([\s\S]*?)\s*```/g;
+      const codeBlockMatches = [...cleaned.matchAll(codeBlockPattern)];
+      
+      if (codeBlockMatches.length > 0) {
+        // Use the first code block found
+        cleaned = codeBlockMatches[0][1].trim();
+        logger.debug('Extracted JSON from code block');
+      } else {
+        // If no code blocks, try to find JSON object or array directly
+        // Look for the first { or [ and match until the closing } or ]
+        const jsonStart = cleaned.search(/[\{\[]/);
+        if (jsonStart !== -1) {
+          let braceCount = 0;
+          let bracketCount = 0;
+          let inString = false;
+          let escapeNext = false;
+          let jsonEnd = jsonStart;
+          
+          for (let i = jsonStart; i < cleaned.length; i++) {
+            const char = cleaned[i];
+            
+            if (escapeNext) {
+              escapeNext = false;
+              continue;
+            }
+            
+            if (char === '\\') {
+              escapeNext = true;
+              continue;
+            }
+            
+            if (char === '"' && !escapeNext) {
+              inString = !inString;
+              continue;
+            }
+            
+            if (!inString) {
+              if (char === '{') braceCount++;
+              if (char === '}') braceCount--;
+              if (char === '[') bracketCount++;
+              if (char === ']') bracketCount--;
+              
+              if (braceCount === 0 && bracketCount === 0) {
+                jsonEnd = i + 1;
+                break;
+              }
+            }
+          }
+          
+          if (jsonEnd > jsonStart) {
+            cleaned = cleaned.substring(jsonStart, jsonEnd);
+            logger.debug('Extracted JSON from content');
+          }
+        }
+      }
+      
+      // Clean up the JSON string
+      cleaned = cleaned.trim();
+      
+      // Remove any leading/trailing non-JSON characters
+      cleaned = cleaned.replace(/^[^{[]*/, '').replace(/[^}\]]*$/, '');
+      
+      // Fix common JSON issues
+      // Remove trailing commas before } or ]
+      cleaned = cleaned.replace(/,(\s*[}\]])/g, '$1');
+      // Remove comments (not valid in JSON but sometimes LLMs add them)
+      cleaned = cleaned.replace(/\/\/.*$/gm, '');
+      cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, '');
+      
+      // Try to parse
+      const parsed = JSON.parse(cleaned);
+      logger.debug('Successfully parsed JSON');
+      return parsed;
+      
+    } catch (error) {
+      logger.error(`JSON extraction failed: ${error.message}`);
+      logger.error(`Original content (first 1000 chars): ${content.substring(0, 1000)}`);
+      
+      // Last resort: try to find any JSON-like structure
+      try {
+        const jsonLike = content.match(/\{[\s\S]{10,}\}|\[[\s\S]{10,}\]/);
+        if (jsonLike) {
+          let attempt = jsonLike[0];
+          attempt = attempt.replace(/,(\s*[}\]])/g, '$1');
+          attempt = attempt.replace(/\/\/.*$/gm, '');
+          const parsed = JSON.parse(attempt);
+          logger.debug('Successfully parsed JSON on second attempt');
+          return parsed;
+        }
+      } catch (secondError) {
+        logger.error(`Second attempt also failed: ${secondError.message}`);
+      }
+      
+      throw new Error(`Failed to parse JSON response: ${error.message}. Content preview: ${content.substring(0, 200)}`);
+    }
+  }
+
   async captureRequirements(clientId, conversationHistory) {
     try {
       const systemPrompt = `You are an expert requirements analyst. Analyze the conversation to extract:
@@ -16,12 +126,21 @@ class OrderDocumentationAgent {
 4. Budget range
 5. Project scope and complexity
 
-Return a structured JSON with these fields.`;
+IMPORTANT: You MUST return ONLY valid JSON, no markdown, no explanations, no code blocks. Return a JSON object with these fields:
+{
+  "techStack": ["tech1", "tech2"],
+  "features": ["feature1", "feature2"],
+  "timeline": "timeline description",
+  "budget": "budget description",
+  "scope": "scope description"
+}
+
+Return ONLY the JSON object, nothing else.`;
 
       const messages = [
         { role: 'system', content: systemPrompt },
         ...conversationHistory,
-        { role: 'user', content: 'Extract and structure the project requirements from this conversation.' }
+        { role: 'user', content: 'Extract and structure the project requirements from this conversation. Return ONLY valid JSON, no markdown, no explanations, no code blocks.' }
       ];
 
       const response = await llmService.chatCompletion(messages, {
@@ -29,7 +148,7 @@ Return a structured JSON with these fields.`;
         max_tokens: 2000
       });
 
-      const requirements = JSON.parse(response.choices[0].message.content);
+      const requirements = this.extractJSON(response.choices[0].message.content);
       return requirements;
     } catch (error) {
       logger.error(`Requirements capture error: ${error.message}`);
@@ -77,19 +196,31 @@ Requirements: ${JSON.stringify(project.requirements)}
 Tech Stack: ${project.techStack.join(', ')}
 Features: ${project.features.join(', ')}
 
-Provide a structured analysis of:
-- Core objectives
-- Technical complexity
-- Key dependencies
-- Risk factors
-- Resource requirements`;
+IMPORTANT: You MUST return ONLY valid JSON, no markdown, no explanations, no code blocks. Return a JSON object with the following structure:
+
+{
+  "coreObjectives": ["objective1", "objective2"],
+  "technicalComplexity": "low|medium|high",
+  "keyDependencies": ["dependency1", "dependency2"],
+  "riskFactors": ["risk1", "risk2"],
+  "resourceRequirements": {
+    "teamSize": number,
+    "timeline": "description",
+    "skills": ["skill1", "skill2"]
+  }
+}
+
+Return ONLY the JSON object, nothing else.`;
 
     const response = await llmService.chatCompletion([
-      { role: 'system', content: 'You are a technical reader agent that analyzes project requirements.' },
+      { role: 'system', content: 'You are a technical reader agent that analyzes project requirements. You MUST always return valid JSON only, never markdown or explanations.' },
       { role: 'user', content: prompt }
-    ]);
+    ], {
+      temperature: 0.3,
+      max_tokens: 1500
+    });
 
-    return JSON.parse(response.choices[0].message.content);
+    return this.extractJSON(response.choices[0].message.content);
   }
 
   async searcherAgent(project, readerAnalysis) {
@@ -99,19 +230,29 @@ ${JSON.stringify(readerAnalysis)}
 
 Tech Stack: ${project.techStack.join(', ')}
 
-Provide:
-- Recommended architectural patterns
-- API design patterns
-- Database schema patterns
-- Security considerations
-- Scalability approaches`;
+IMPORTANT: Recommend MERN stack patterns (MongoDB, Express.js, React, Node.js) for web applications and React Native patterns for mobile applications. If different technologies are mentioned, suggest MERN stack alternatives.
+
+IMPORTANT: You MUST return ONLY valid JSON, no markdown, no explanations, no code blocks. Return a JSON object with the following structure:
+
+{
+  "architecturalPatterns": ["pattern1", "pattern2"],
+  "apiDesignPatterns": ["pattern1", "pattern2"],
+  "databaseSchemaPatterns": ["pattern1", "pattern2"],
+  "securityConsiderations": ["consideration1", "consideration2"],
+  "scalabilityApproaches": ["approach1", "approach2"]
+}
+
+Return ONLY the JSON object, nothing else.`;
 
     const response = await llmService.chatCompletion([
-      { role: 'system', content: 'You are a technical searcher agent that finds relevant patterns and best practices.' },
+      { role: 'system', content: 'You are a technical searcher agent that finds relevant patterns and best practices. Always recommend MERN stack for web and React Native for mobile. You MUST always return valid JSON only, never markdown or explanations.' },
       { role: 'user', content: prompt }
-    ]);
+    ], {
+      temperature: 0.3,
+      max_tokens: 1500
+    });
 
-    return JSON.parse(response.choices[0].message.content);
+    return this.extractJSON(response.choices[0].message.content);
   }
 
   async budgetEstimationAgent(project, readerAnalysis) {
@@ -144,17 +285,41 @@ Provide a detailed budget breakdown in INR with:
 - Cost per phase/milestone if applicable
 - Assumptions and notes
 
-Return as structured JSON with: totalBudget, currency, breakdown (array of {category, amount, percentage, description}), phases (if applicable), assumptions.`;
+IMPORTANT: You MUST return ONLY valid JSON, no markdown, no explanations, no code blocks. Return a JSON object with this exact structure:
+
+{
+  "totalBudget": number,
+  "currency": "INR",
+  "breakdown": [
+    {
+      "category": "Development",
+      "amount": number,
+      "percentage": number,
+      "description": "description"
+    }
+  ],
+  "phases": [
+    {
+      "name": "Phase name",
+      "budget": number,
+      "duration": "duration",
+      "description": "description"
+    }
+  ],
+  "assumptions": ["assumption1", "assumption2"]
+}
+
+Return ONLY the JSON object, nothing else.`;
 
     const response = await llmService.chatCompletion([
-      { role: 'system', content: 'You are an expert project cost estimator specializing in software development projects. Provide accurate, realistic budget estimates based on project requirements.' },
+      { role: 'system', content: 'You are an expert project cost estimator specializing in software development projects. Provide accurate, realistic budget estimates based on project requirements. You MUST always return valid JSON only, never markdown or explanations.' },
       { role: 'user', content: prompt }
     ], {
       temperature: 0.3,
       max_tokens: 2000
     });
 
-    return JSON.parse(response.choices[0].message.content);
+    return this.extractJSON(response.choices[0].message.content);
   }
 
   async writerAgent(project, readerAnalysis, searcherPatterns, budgetEstimate) {
@@ -165,27 +330,42 @@ Analysis: ${JSON.stringify(readerAnalysis)}
 Patterns: ${JSON.stringify(searcherPatterns)}
 Budget Estimate: ${JSON.stringify(budgetEstimate)}
 
+IMPORTANT: Use MERN stack (MongoDB, Express.js, React, Node.js) for web applications and React Native for mobile applications. If the project mentions different technologies, change them to MERN stack and React Native in the documentation.
+
 Create documentation sections:
 1. Project Overview
-2. Technical Architecture
-3. API Endpoints Specification
-4. Database Schema
+2. Technical Architecture (use MERN stack for web, React Native for mobile)
+3. API Endpoints Specification (Express.js/Node.js REST APIs)
+4. Database Schema (MongoDB with Mongoose ODM)
 5. Implementation Timeline
-6. Tech Stack Details
+6. Tech Stack Details (MERN: MongoDB, Express.js, React, Node.js for web; React Native for mobile)
 7. Features Breakdown
 8. Budget Estimation (include the detailed budget breakdown with categories, phases, and assumptions)
 
-Format as structured JSON with each section as a separate field.`;
+IMPORTANT: You MUST return ONLY valid JSON, no markdown, no explanations, no code blocks. Return a JSON object with this exact structure:
+
+{
+  "projectOverview": "overview text",
+  "technicalArchitecture": "architecture text",
+  "apiEndpoints": "endpoints text",
+  "databaseSchema": "schema text",
+  "implementationTimeline": "timeline text",
+  "techStackDetails": "tech stack text",
+  "featuresBreakdown": "features text",
+  "budgetEstimation": "budget text"
+}
+
+Return ONLY the JSON object, nothing else.`;
 
     const response = await llmService.chatCompletion([
-      { role: 'system', content: 'You are a technical writer agent that creates comprehensive project documentation.' },
+      { role: 'system', content: 'You are a technical writer agent that creates comprehensive project documentation. You MUST always return valid JSON only, never markdown or explanations.' },
       { role: 'user', content: prompt }
     ], {
       temperature: 0.5,
       max_tokens: 4000
     });
 
-    const docData = JSON.parse(response.choices[0].message.content);
+    const docData = this.extractJSON(response.choices[0].message.content);
     
     // Structure sections
     const sections = [
@@ -220,14 +400,27 @@ Check for:
 - Missing information
 - Areas needing clarification
 
-Provide verification report with any missing or incomplete sections.`;
+IMPORTANT: You MUST return ONLY valid JSON, no markdown, no explanations, no code blocks. Return a JSON object with this structure:
+
+{
+  "completeness": 0.0 to 1.0,
+  "technicalAccuracy": "assessment",
+  "consistency": "assessment",
+  "missingInformation": ["item1", "item2"],
+  "areasNeedingClarification": ["area1", "area2"]
+}
+
+Return ONLY the JSON object, nothing else.`;
 
     const response = await llmService.chatCompletion([
-      { role: 'system', content: 'You are a verification agent that ensures documentation quality and completeness.' },
+      { role: 'system', content: 'You are a verification agent that ensures documentation quality and completeness. You MUST always return valid JSON only, never markdown or explanations.' },
       { role: 'user', content: prompt }
-    ]);
+    ], {
+      temperature: 0.3,
+      max_tokens: 1000
+    });
 
-    const verification = JSON.parse(response.choices[0].message.content);
+    const verification = this.extractJSON(response.choices[0].message.content);
     
     if (verification.completeness < 0.8) {
       logger.warn(`Documentation completeness: ${verification.completeness}`);
@@ -279,14 +472,19 @@ Provide verification report with any missing or incomplete sections.`;
       });
 
       // Generate response
-      const systemPrompt = `You are a friendly project requirements specialist. Help the client articulate their tech project needs through natural conversation. Ask clarifying questions about:
+      const systemPrompt = `You are a friendly project requirements specialist. Help the client articulate their tech project needs through natural conversation.
+
+IMPORTANT: You MUST prefer and recommend MERN stack (MongoDB, Express.js, React, Node.js) for web applications and React Native for mobile applications. If the user mentions different technologies, gently guide them toward MERN stack and React Native by explaining the benefits:
+- MERN stack: Full JavaScript stack, faster development, large community, scalable, cost-effective
+- React Native: Code once, deploy to iOS and Android, shared codebase, native performance, faster development
+
+Ask clarifying questions about:
 - What they want to build
-- Technology preferences
 - Timeline expectations
 - Budget considerations
 - Key features and functionality
 
-Be conversational and helpful.`;
+Always suggest MERN stack for web and React Native for mobile, but be respectful if they have strong preferences. Be conversational and helpful.`;
 
       const messages = [
         { role: 'system', content: systemPrompt },
