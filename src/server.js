@@ -16,14 +16,20 @@ const httpServer = createServer(app);
 
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(helmet());
-app.use(cors({
-  origin: process.env.FRONTEND_URL || '*',
-  credentials: true
+// Middleware// Middleware
+app.use(cors()); // ✅ allow all
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      // Allow cross-origin requests
+    }
+  }
 }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
 
 // Rate limiting
 const limiter = rateLimit({
